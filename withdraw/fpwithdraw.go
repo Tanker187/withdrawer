@@ -11,19 +11,24 @@ import (
 	"github.com/ethereum-optimism/optimism/op-node/withdrawals"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/ethclient/gethclient"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
 type FPWithdrawer struct {
-	Ctx      context.Context
-	L1Client *ethclient.Client
-	L2Client *rpc.Client
-	L2TxHash common.Hash
-	Portal   *bindingspreview.OptimismPortal2
-	Factory  *bindings.DisputeGameFactory
-	Opts     *bind.TransactOpts
+	Ctx           context.Context
+	L1Client      *ethclient.Client
+	L2Client      *rpc.Client
+	L2TxHash      common.Hash
+	Portal        *bindingspreview.OptimismPortal2
+	Factory       *bindings.DisputeGameFactory
+	Opts          *bind.TransactOpts
+	GasMultiplier float64 // Multiplier for estimated gas (default 1.0)
+	UserGasLimit  uint64  // Original user-specified gas limit (0 means auto-estimate)
+	DryRun        bool    // Simulate transactions without submitting
 }
 
 func (w *FPWithdrawer) CheckIfProvable() error {
@@ -89,31 +94,53 @@ func (w *FPWithdrawer) ProveWithdrawal() error {
 		return err
 	}
 
+	withdrawalTx := bindingspreview.TypesWithdrawalTransaction{
+		Nonce:    params.Nonce,
+		Sender:   params.Sender,
+		Target:   params.Target,
+		Value:    params.Value,
+		GasLimit: params.GasLimit,
+		Data:     params.Data,
+	}
+	outputRootProof := bindingspreview.TypesOutputRootProof{
+		Version:                  params.OutputRootProof.Version,
+		StateRoot:                params.OutputRootProof.StateRoot,
+		MessagePasserStorageRoot: params.OutputRootProof.MessagePasserStorageRoot,
+		LatestBlockhash:          params.OutputRootProof.LatestBlockhash,
+	}
+
+	// Prepare gas options with multiplier if configured
+	simulatedTx, err := prepareGasOpts(w.Opts, w.UserGasLimit, w.GasMultiplier, w.DryRun, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return w.Portal.ProveWithdrawalTransaction(
+			opts,
+			withdrawalTx,
+			params.L2OutputIndex,
+			outputRootProof,
+			params.WithdrawalProof,
+		)
+	})
+	if err != nil {
+		return err
+	}
+
+	if w.DryRun {
+		printDryRun("ProveWithdrawal", simulatedTx, w.Opts.From, w.Opts.GasLimit)
+		return nil
+	}
+
 	// create the proof
 	tx, err := w.Portal.ProveWithdrawalTransaction(
 		w.Opts,
-		bindingspreview.TypesWithdrawalTransaction{
-			Nonce:    params.Nonce,
-			Sender:   params.Sender,
-			Target:   params.Target,
-			Value:    params.Value,
-			GasLimit: params.GasLimit,
-			Data:     params.Data,
-		},
+		withdrawalTx,
 		params.L2OutputIndex, // this is overloaded and is the DisputeGame index in this context
-		bindingspreview.TypesOutputRootProof{
-			Version:                  params.OutputRootProof.Version,
-			StateRoot:                params.OutputRootProof.StateRoot,
-			MessagePasserStorageRoot: params.OutputRootProof.MessagePasserStorageRoot,
-			LatestBlockhash:          params.OutputRootProof.LatestBlockhash,
-		},
+		outputRootProof,
 		params.WithdrawalProof,
 	)
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("Proved withdrawal for %s: %s\n", w.L2TxHash.String(), tx.Hash().String())
+	log.Info("Proved withdrawal", "l2TxHash", w.L2TxHash, "l1TxHash", tx.Hash())
 
 	// Wait 5 mins max for confirmation
 	ctxWithTimeout, cancel := context.WithTimeout(w.Ctx, 5*time.Minute)
@@ -122,7 +149,11 @@ func (w *FPWithdrawer) ProveWithdrawal() error {
 }
 
 func (w *FPWithdrawer) IsProofFinalized() (bool, error) {
-	return w.Portal.FinalizedWithdrawals(&bind.CallOpts{}, w.L2TxHash)
+	hash, err := w.getWithdrawalHash()
+	if err != nil {
+		return false, err
+	}
+	return w.Portal.FinalizedWithdrawals(&bind.CallOpts{}, hash)
 }
 
 func (w *FPWithdrawer) FinalizeWithdrawal() error {
@@ -152,23 +183,35 @@ func (w *FPWithdrawer) FinalizeWithdrawal() error {
 		return err
 	}
 
-	// finalize the withdrawal
-	tx, err := w.Portal.FinalizeWithdrawalTransaction(
-		w.Opts,
-		bindingspreview.TypesWithdrawalTransaction{
-			Nonce:    ev.Nonce,
-			Sender:   ev.Sender,
-			Target:   ev.Target,
-			Value:    ev.Value,
-			GasLimit: ev.GasLimit,
-			Data:     ev.Data,
-		},
-	)
+	withdrawalTx := bindingspreview.TypesWithdrawalTransaction{
+		Nonce:    ev.Nonce,
+		Sender:   ev.Sender,
+		Target:   ev.Target,
+		Value:    ev.Value,
+		GasLimit: ev.GasLimit,
+		Data:     ev.Data,
+	}
+
+	// Prepare gas options with multiplier if configured
+	simulatedTx, err := prepareGasOpts(w.Opts, w.UserGasLimit, w.GasMultiplier, w.DryRun, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return w.Portal.FinalizeWithdrawalTransaction(opts, withdrawalTx)
+	})
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("Completed withdrawal for %s: %s\n", w.L2TxHash.String(), tx.Hash().String())
+	if w.DryRun {
+		printDryRun("FinalizeWithdrawal", simulatedTx, w.Opts.From, w.Opts.GasLimit)
+		return nil
+	}
+
+	// finalize the withdrawal
+	tx, err := w.Portal.FinalizeWithdrawalTransaction(w.Opts, withdrawalTx)
+	if err != nil {
+		return err
+	}
+
+	log.Info("Completed withdrawal", "l2TxHash", w.L2TxHash, "l1TxHash", tx.Hash())
 
 	// Wait 5 mins max for confirmation
 	ctxWithTimeout, cancel := context.WithTimeout(w.Ctx, 5*time.Minute)
